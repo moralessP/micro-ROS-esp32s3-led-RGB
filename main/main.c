@@ -4,6 +4,8 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "driver/gpio.h"
+#include "led_strip.h"
 #include "esp_log.h"
 #include "esp_system.h"
 
@@ -21,22 +23,37 @@
 #define RCCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){printf("Failed status on line %d: %d. Aborting.\n",__LINE__,(int)temp_rc);vTaskDelete(NULL);}}
 #define RCSOFTCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){printf("Failed status on line %d: %d. Continuing.\n",__LINE__,(int)temp_rc);}}
 
-static const char *TAG = "led_rgb";
+#define LED_RGB_GPIO 38
+#define LEN_DATA 3
+
+static led_strip_handle_t led_strip;
 
 rcl_subscription_t subscriber;
 std_msgs__msg__UInt8MultiArray led_rgb_msg;
 
+static void configure_led(void)
+{
+    led_strip_config_t strip_config = {
+        .strip_gpio_num = LED_RGB_GPIO,
+        .max_leds = 1, 
+    };
+
+    led_strip_rmt_config_t rmt_config = {
+        .resolution_hz = 10 * 1000 * 1000,
+        .flags.with_dma = false,
+    };
+    ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip));
+
+    ESP_ERROR_CHECK(led_strip_clear(led_strip));
+}
+
 void subscription_callback(const void *msgin)
 {
     const std_msgs__msg__UInt8MultiArray *msg = (const std_msgs__msg__UInt8MultiArray *)msgin;
-    if (msg->data.size == 3)
-    {
-        printf("Received RGB values: R=%d, G=%d, B=%d\n", msg->data.data[0], msg->data.data[1], msg->data.data[2]);
-    }
-    else
-    {
-        ESP_LOGI(TAG, "Received data size is not correct. Expected 3, got %zu\n", msg->data.size);
-    }
+
+    ESP_ERROR_CHECK(led_strip_clear(led_strip));
+    ESP_ERROR_CHECK(led_strip_set_pixel(led_strip, 0, msg->data.data[0], msg->data.data[1], msg->data.data[2]));
+    ESP_ERROR_CHECK(led_strip_refresh(led_strip));
 }
 
 void uros_task(void *arg)
@@ -65,9 +82,18 @@ void uros_task(void *arg)
         ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt8MultiArray),
         "led_rgb"));
     
-    rclc_executor_t executor;
-    RCCHECK(rclc_executor_init(&executor, &support.context, 1, &allocator));
+    // Create executor.
+	rclc_executor_t executor = rclc_executor_get_zero_initialized_executor();
+	RCCHECK(rclc_executor_init(&executor, &support.context, 1, &allocator));
+	unsigned int rcl_wait_timeout = 1000;
+	RCCHECK(rclc_executor_set_timeout(&executor, RCL_MS_TO_NS(rcl_wait_timeout)));
+
     RCCHECK(rclc_executor_add_subscription(&executor, &subscriber, &led_rgb_msg, &subscription_callback, ON_NEW_DATA));
+
+    uint8_t led_rgb_data[LEN_DATA];
+    led_rgb_msg.data.data = led_rgb_data;
+    led_rgb_msg.data.size = 0;
+    led_rgb_msg.data.capacity = LEN_DATA;
 
     while (1) {
         rclc_executor_spin_some(&executor, RCL_MS_TO_NS(100));
@@ -80,15 +106,17 @@ void uros_task(void *arg)
 
 void app_main(void)
 {
+
+    configure_led();
 #if defined(CONFIG_MICRO_ROS_ESP_NETIF_WLAN) || defined(CONFIG_MICRO_ROS_ESP_NETIF_ENET)
     ESP_ERROR_CHECK(uros_network_interface_initialize());
 #endif
 
-    //pin micro-ros task in APP_CPU to make PRO_CPU to deal with wifi:
     xTaskCreate(uros_task,
             "uros_task",
             CONFIG_MICRO_ROS_APP_STACK,
             NULL,
             CONFIG_MICRO_ROS_APP_TASK_PRIO,
             NULL);
+
 }
